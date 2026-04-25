@@ -260,3 +260,169 @@ redline/
 ├── tailwind.config.ts
 └── tsconfig.json
 ```
+
+---
+
+## 5. Environment variables
+
+| Var | Where | Purpose | Demo value source |
+|---|---|---|---|
+| `AI_GATEWAY_API_KEY` | Vercel + `.env.local` | One key for Gemini/Opus/Haiku/embeddings | Vercel dashboard → AI Gateway |
+| `DATABASE_URL` | Vercel + `.env.local` | Neon Postgres (pooled) | Neon dashboard |
+| `DATABASE_URL_UNPOOLED` | Vercel + `.env.local` | Neon direct (for migrations only) | Neon dashboard |
+| `BLOB_READ_WRITE_TOKEN` | Vercel + `.env.local` | Vercel Blob | Vercel Storage tab (auto-injected on Vercel) |
+| `SLACK_SIGNING_SECRET` | Vercel + `.env.local` | Slack request verification | Slack app config |
+| `SLACK_BOT_TOKEN` | Vercel + `.env.local` | Slack API calls (post messages, upload files) | Slack app config |
+| `SLACK_APP_TOKEN` | (not used) | Socket Mode — we don't use this; HTTP only | — |
+| `MCP_BEARER_TOKEN` | Vercel + `.env.local` | Auth for the MCP endpoint (internal use) | Generated, stored in 1Password |
+| `NODE_ENV` | implicit | `production` on Vercel, `development` locally | — |
+
+**Not in env, by design**:
+- Anthropic / Google / OpenAI direct keys — all traffic goes through AI Gateway with the single `AI_GATEWAY_API_KEY`.
+- Claude Max credentials — Max is documented for the Claude Code CLI dev loop only (`ANTHROPIC_BASE_URL` + `x-ai-gateway-api-key` header pattern). Runtime app calls use the regular `AI_GATEWAY_API_KEY`. Documented this distinction so we don't try to wire Max into runtime code where it doesn't apply.
+
+`.env.local` is gitignored. `.env.example` is committed with placeholder values.
+
+---
+
+## 6. Hobby plan compliance
+
+For each Vercel feature we use, the limit and how we stay under it:
+
+| Feature | Hobby limit | How we stay under |
+|---|---|---|
+| **Function execution** | 60s per invocation (Fluid compute Standard CPU) | Vercel Workflow splits the review into per-step invocations — each step is its own 60s window. A 50-page document is ~50+ invocations, never one long one. |
+| **Function memory** | 2 GB (Fluid Standard) | Per-page extraction, never load whole PDF into memory in one step. |
+| **Bandwidth** | 100 GB/mo | Demo traffic is single-digit GB. PDFs served via Blob CDN, not through functions. |
+| **Vercel Blob storage** | 1 GB total | Demo PDFs are small (≤ 20 MB each). Two demo projects ≈ 80 MB. We delete intermediate artifacts after redline render. |
+| **Vercel Blob ops** | 1k advanced ops/mo | Each review = 1 upload (original) + 1 upload (redlined). Plenty of headroom for the demo. |
+| **AI Gateway free credit** | $5/mo | Demo is single-digit dollars. Vision pages are the cost driver — we cache extractions in Postgres so re-running a review on the same sheet is free. |
+| **Cron jobs** | 2 jobs, daily only | Not used in v1. (Production will likely add a nightly NFPA reindex job — that's a Pro consideration.) |
+| **Deployments** | unlimited | n/a |
+| **ZDR** | not available on Hobby | Documented in §7. |
+| **Bun runtime on Vercel** | Public Beta (since Oct 2025) | We deploy on **Node** for the demo to avoid beta-runtime surprises. Bun is local-dev only. |
+
+**Workflow-step pattern that does the heavy lifting**:
+
+```ts
+// lib/agent/workflows/review-sheet.ts
+"use workflow";
+import { extractNotes } from "../steps/extract-notes";
+import { reviewPage }   from "../steps/review-page";
+
+export async function reviewSheet({ documentId }: { documentId: string }) {
+  const pages = await loadPages(documentId);            // step 1
+  const results = [];
+  for (const page of pages) {
+    const notes    = await extractNotes(page);          // own 60s budget
+    const findings = await reviewPage(page, notes);     // own 60s budget
+    results.push(findings);
+  }
+  return await renderRedline(documentId, results);      // own 60s budget
+}
+```
+
+Each `await` of a step is a separate function invocation. Hobby's 60s ceiling never blocks a long review — only an individual step that takes >60s would, and our steps are bounded (one model call + DB write).
+
+---
+
+## 7. Data privacy
+
+**Demo (Hobby)**:
+- AI Gateway routes through Anthropic, Google, and OpenAI under their **default API policies**. Anthropic's default API policy prohibits training on customer prompts/completions; Google and OpenAI API endpoints likewise default to no-train.
+- We do **not** have team-wide ZDR (that's a Pro/Enterprise feature on AI Gateway).
+- Per-request ZDR via `providerOptions.gateway.zeroDataRetention: true` is available on the request itself, but only routes the request through providers that have ZDR agreements with Vercel — useful as a hint, not a guarantee.
+
+**Production (Pro)**:
+- Upgrade to Pro → enable team-wide ZDR on AI Gateway → every request enforced regardless of code.
+- Document in `docs/PRIVACY.md` (post-v1).
+
+**What we never send to a model**:
+- Client identifying info on plan title blocks: redacted before vision extraction in production. For the internal-only demo we skip the redaction step (it's our own projects).
+
+---
+
+## 8. Packages
+
+### Runtime — frameworks
+| Package | Why |
+|---|---|
+| `next` (15.x) | App Router, route handlers, server components |
+| `react`, `react-dom` (19.x) | UI |
+| `typescript` | type safety |
+
+### Runtime — AI / agent
+| Package | Why |
+|---|---|
+| `ai` (v6.x) | Vercel AI SDK — `generateObject`, `generateText`, model routing via Gateway |
+| `workflow` | Vercel Workflow SDK — `"use workflow"` / `"use step"` directives, durable execution |
+| `@workflow/ai` | `DurableAgent` class — agent loop where every LLM call & tool call is its own step |
+| `zod` | Schemas for tool args + structured outputs |
+
+### Runtime — surfaces
+| Package | Why |
+|---|---|
+| `@vercel/slack-bolt` | Slack Bolt + `VercelReceiver` (3-sec ack via Fluid `waitUntil`) |
+| `@slack/bolt` | Peer dep of `@vercel/slack-bolt` |
+| `@vercel/mcp-adapter` | MCP server endpoint mounted as a Next.js route handler; Streamable HTTP transport |
+
+### Runtime — data
+| Package | Why |
+|---|---|
+| `@neondatabase/serverless` | Neon's HTTP/WS driver, optimized for Vercel Functions |
+| `drizzle-orm` | Typed query builder + migrations against Neon |
+| `drizzle-kit` (dev) | Migration tooling |
+| `@vercel/blob` | Signed uploads + storage for original/redlined PDFs |
+
+### Runtime — PDF
+| Package | Why |
+|---|---|
+| `pdf-lib` | Pure-JS PDF annotation writer (rectangles, freetext, line callouts) — runs in Node serverless |
+| `pdfjs-dist` | PDF rendering in the React reviewer (use `pdfjs-dist/legacy/build/pdf.mjs` for SSR-safe import; viewer is dynamic-imported with `ssr: false`) |
+
+### Runtime — UI
+| Package | Why |
+|---|---|
+| `tailwindcss`, `@tailwindcss/postcss` | styling |
+| `geist` | Geist font (Vercel's typeface) |
+| `lucide-react` | icons |
+| `class-variance-authority`, `clsx`, `tailwind-merge` | shadcn primitives' deps |
+| `@radix-ui/*` (selective) | shadcn/ui underlying primitives — install per-component |
+
+### Runtime — utilities
+| Package | Why |
+|---|---|
+| `nanoid` | short IDs for findings/notes |
+| `typo-js` | spellcheck for `checkSpelling` tool |
+
+### Dev
+| Package | Why |
+|---|---|
+| `bun` (local only — system) | local dev runtime, package install |
+| `eslint`, `eslint-config-next` | lint |
+| `prettier`, `prettier-plugin-tailwindcss` | format |
+| `tsx` | run `scripts/*.ts` files locally |
+| `vitest` | tests for retrieval + redline coord math (the parts that need to be deterministic) |
+
+**Install commands (local, Bun)**:
+```bash
+bun add next react react-dom ai workflow @workflow/ai zod
+bun add @vercel/slack-bolt @slack/bolt @vercel/mcp-adapter
+bun add @neondatabase/serverless drizzle-orm @vercel/blob
+bun add pdf-lib pdfjs-dist
+bun add tailwindcss @tailwindcss/postcss geist lucide-react
+bun add class-variance-authority clsx tailwind-merge
+bun add nanoid typo-js
+bun add -d typescript @types/react @types/react-dom @types/node
+bun add -d drizzle-kit eslint eslint-config-next prettier prettier-plugin-tailwindcss tsx vitest
+```
+
+`vercel.json` pins Node for prod:
+
+```json
+{
+  "functions": {
+    "app/api/**/route.ts": { "runtime": "nodejs22.x" }
+  }
+}
+```
